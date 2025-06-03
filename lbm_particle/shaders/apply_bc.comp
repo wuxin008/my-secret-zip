@@ -1,0 +1,236 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+#define D 3
+#define Q 19
+float w[Q] = {
+    1.0f /  3.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+};
+
+ivec3 e[Q] = {
+    { 0,  0,  0},
+    { 1,  0,  0},
+    {-1,  0,  0},
+    { 0,  1,  0},
+    { 0, -1,  0},
+    { 0,  0,  1},
+    { 0,  0, -1},
+    { 1,  1,  0},
+    { 1, -1,  0},
+    {-1,  1,  0},
+    {-1, -1,  0},
+    { 1,  0,  1},
+    { 1,  0, -1},
+    {-1,  0,  1},
+    {-1,  0, -1},
+    { 0,  1,  1},
+    { 0,  1, -1},
+    { 0, -1,  1},
+    { 0, -1, -1},
+};
+
+uint bc_type[6] = {0, 0, 0, 0, 0, 0}; //-x +x -y +y -z +z
+vec3 bc_value[6] = { //-x +x -y +y -z +z
+    {  0.0f,   0.0f,   0.0f},
+    {  0.0f,   0.0f,   0.0f},
+    {  0.0f,   0.0f,   0.0f},
+    {  0.0f,   0.0f,   0.0f},
+    {  0.0f,   0.0f,   0.0f},
+    {  0.1f,   0.0f,   0.0f}
+};
+
+struct vecQ {
+    float f[Q];
+};
+
+vecQ Add(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] + b.f[q];
+    }
+    return result;
+}
+
+vecQ Sub(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] - b.f[q];
+    }
+    return result;
+}
+
+vecQ createVecQ(vec3 u) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = dot(e[q], u);
+    }
+    return result;
+}
+
+vecQ createVecQ(float rho, vecQ eu, float uv) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = w[q] * rho * (1.0f + 3.0f * eu.f[q] + 4.5f * eu.f[q] * eu.f[q] - 1.5f * uv);
+    }
+    return result;
+}
+
+struct Particle {
+	vec4 position;
+    vec4 color;
+};
+
+layout (std430, binding = 0) uniform SimulateUBO {
+    uint Nx;
+    uint Ny;
+    uint Nz;
+    uint Nxyz;
+    uint particleCount;
+    float niu;
+    float tau;
+    float inv_tau;
+} ubo;
+
+layout(std430, binding = 1) buffer Particles {
+   Particle particles[];
+};
+
+layout(std430, binding = 2) buffer Velocity {
+    vec4 vel[];
+};
+
+layout(std430, binding = 3) buffer Rho {
+    float rho[];
+};
+
+layout(std430, binding = 4) buffer Mask {
+    float mask[];
+};
+
+layout(std430, binding = 5) buffer FOld {
+    vecQ f_old[];
+};
+
+layout(std430, binding = 6) buffer FNew {
+    vecQ f_new[];
+};
+
+vecQ f_eq(uint ijz) {
+    return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
+}
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void apply_bc_core(int outer, uint dr, uint ibc, uint inb) {
+    if (outer == 1) {
+        if (bc_type[dr] == 0) {
+            vel[ibc].xyz = bc_value[dr];
+        }
+        else if (bc_type[dr] == 1) {
+            vel[ibc] = vel[inb];
+        }
+    }
+    rho[ibc] = rho[inb];
+    f_old[ibc] = Add(Sub(f_eq(ibc), f_eq(inb)), f_old[inb]);
+    //f_old[ibc] = f_eq(ibc);
+}
+
+void main() 
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
+    
+    // index = i + (j + k * ubo.Ny) * ubo.Nx;
+    uint i = index % ubo.Nx, j = (index - i) / ubo.Nx % ubo.Ny, k = index / ubo.Nx / ubo.Ny;
+
+    if (i < 0 || i > ubo.Nx - 1 || j < 0 || j > ubo.Ny - 1 || k < 0 || k > ubo.Nz - 1) return;
+
+    bool i0 = (i == 0), iN = (i == ubo.Nx - 1), j0 = (j == 0), jN = (j == ubo.Ny - 1), k0 = (k == 0), kN = (k == ubo.Nz - 1);
+    if (i0 && !j0 && !jN && !k0 && !kN) {
+        apply_bc_core(1, 0, index, index + 1);
+    }
+    else if (iN && !j0 && !jN && !k0 && !kN) {
+        apply_bc_core(1, 1, index, index - 1);
+    }
+    else if (j0 && !i0 && !iN && !k0 && !kN) {
+        apply_bc_core(1, 2, index, index + ubo.Nx);
+    }
+    else if (jN && !i0 && !iN && !k0 && !kN) {
+        apply_bc_core(1, 3, index, index - ubo.Nx);
+    }
+    else if (k0 && !i0 && !iN && !j0 && !jN) {
+        apply_bc_core(1, 4, index, index + ubo.Ny * ubo.Nx);
+    }
+    else if (kN && !i0 && !iN && !j0 && !jN) {
+        apply_bc_core(1, 5, index, index - ubo.Ny * ubo.Nx);
+    }
+
+    //if (i0) {
+    //    apply_bc_core(1, 0, index, index + 1);
+    //}
+    //else if (iN) {
+    //    apply_bc_core(1, 1, index, index - 1);
+    //}
+    //else if (j0) {
+    //    apply_bc_core(1, 2, index, index + ubo.Nx);
+    //}
+    //else if (jN) {
+    //    apply_bc_core(1, 3, index, index - ubo.Nx);
+    //}
+    //else if (k0) {
+    //    apply_bc_core(1, 4, index, index + ubo.Ny * ubo.Nx);
+    //}
+    //else if (kN) {
+    //    apply_bc_core(1, 5, index, index - ubo.Ny * ubo.Nx);
+    //}
+
+    //if (j == 0) {
+    //    apply_bc_core(1, 0, ij, ij + 1);
+    //}
+    //else if (j == ubo.width - 1) {
+    //    apply_bc_core(1, 2, ij, ij - 1);
+    //}
+    //else if (i == 0) {
+    //    apply_bc_core(1, 1, ij, ij + ubo.width);
+    //}
+    //else if (i == ubo.height - 1) {
+    //    apply_bc_core(1, 3, ij, ij - ubo.width);
+    //}
+    
+    //if (mask[ij] > 0) {
+    //    vel[ij] = vec2(0.0f, 0.0f);
+    //    uint inb = 0, jnb = 0;
+    //    if (i >= ubo.cy_para[1]){
+    //        inb = i + 1;
+    //    }
+    //    else {
+    //        inb = i - 1;
+    //    }
+    //    if (j >= ubo.cy_para[0]) {
+    //        jnb = j + 1;
+    //    }
+    //    else {
+    //        jnb = j - 1;
+    //    }
+    //    apply_bc_core(0, 0, ij, inb * ubo.width + jnb);
+    //}
+}

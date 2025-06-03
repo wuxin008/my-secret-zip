@@ -1,0 +1,286 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+#define D 3
+#define Q 19
+float w[Q] = {
+    1.0f /  3.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+};
+
+ivec3 e[Q] = {
+    { 0,  0,  0},
+    { 1,  0,  0},
+    {-1,  0,  0},
+    { 0,  1,  0},
+    { 0, -1,  0},
+    { 0,  0,  1},
+    { 0,  0, -1},
+    { 1,  1,  0},
+    { 1, -1,  0},
+    {-1,  1,  0},
+    {-1, -1,  0},
+    { 1,  0,  1},
+    { 1,  0, -1},
+    {-1,  0,  1},
+    {-1,  0, -1},
+    { 0,  1,  1},
+    { 0,  1, -1},
+    { 0, -1,  1},
+    { 0, -1, -1},
+};
+
+struct vecQ {
+    float f[Q];
+};
+
+vecQ Add(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] + b.f[q];
+    }
+    return result;
+}
+
+vecQ Sub(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] - b.f[q];
+    }
+    return result;
+}
+
+vecQ createVecQ(vec3 u) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = dot(e[q], u);
+    }
+    return result;
+}
+
+vecQ createVecQ(float rho, vecQ eu, float uv) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = w[q] * rho * (1.0f + 3.0f * eu.f[q] + 4.5f * eu.f[q] * eu.f[q] - 1.5f * uv);
+    }
+    return result;
+}
+
+struct Particle {
+	vec4 position;
+    vec4 color;
+};
+
+layout (std430, binding = 0) uniform SimulateUBO {
+    uint Nx;
+    uint Ny;
+    uint Nz;
+    uint Nxyz;
+    uint particleCount;
+    float niu;
+    float tau;
+    float inv_tau;
+} ubo;
+
+layout(std430, binding = 1) buffer Particles {
+   Particle particles[];
+};
+
+layout(std430, binding = 2) buffer Velocity {
+    vec4 vel[];
+};
+
+layout(std430, binding = 3) buffer Rho {
+    float rho[];
+};
+
+layout(std430, binding = 4) buffer Mask {
+    float mask[];
+};
+
+layout(std430, binding = 5) buffer FOld {
+    vecQ f_old[];
+};
+
+layout(std430, binding = 6) buffer FNew {
+    vecQ f_new[];
+};
+
+vecQ f_eq(uint ijz) {
+    return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
+}
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+vec4 plasma(float t) {
+    t = clamp(t, 0.0, 1.0);
+    
+    // 关键颜色点（来自Matplotlib的plasma数据）
+    const vec4 c0 = vec4(0.050383, 0.029803, 0.527975, 1.0); // t=0.0
+    const vec4 c1 = vec4(0.529414, 0.026526, 0.625659, 1.0); // t≈0.25
+    const vec4 c2 = vec4(0.920492, 0.383213, 0.298564, 1.0); // t≈0.5
+    const vec4 c3 = vec4(0.988474, 0.644367, 0.145109, 1.0); // t≈0.75
+    const vec4 c4 = vec4(0.940015, 0.975158, 0.131326, 1.0); // t=1.0
+    
+    // 分段线性插值
+    if (t < 0.25) {
+        return mix(c0, c1, t / 0.25);
+    } else if (t < 0.5) {
+        return mix(c1, c2, (t - 0.25) / 0.25);
+    } else if (t < 0.75) {
+        return mix(c2, c3, (t - 0.5) / 0.25);
+    } else {
+        return mix(c3, c4, (t - 0.75) / 0.25);
+    }
+}
+
+vec4 colorMap(float t) {
+    t = clamp(t, -1.0, 1.0);
+    
+    // 关键颜色点（来自Matplotlib的plasma数据）
+    const vec4 c0 = vec4(1.0, 1.0, 0.0, 1.0); // t=0.0
+    const vec4 c1 = vec4(0.953, 0.490, 0.016, 1.0); // t≈0.25
+    const vec4 c2 = vec4(0.0, 0.0, 0.0, 1.0); // t≈0.5
+    const vec4 c3 = vec4(0.176, 0.976, 0.529, 1.0); // t≈0.75
+    const vec4 c4 = vec4(0.0, 1.0, 1.0, 1.0); // t=1.0
+    
+    // 分段线性插值
+    if (t < -0.5f) {
+        return mix(c0, c1, (t + 1.0f) * 2);
+    } else if (t < 0.00f) {
+        return mix(c1, c2, (t + 0.5f) * 2);
+    } else if (t < 0.5f) {
+        return mix(c2, c3, t * 2);
+    } else {
+        return mix(c3, c4, (t - 0.5f) * 2);
+    }
+}
+
+vec2 gradient(uint i, uint j, uint k) {
+    uint index = i + (j + k * ubo.Ny) * ubo.Nx;
+
+    vec2 result;
+    //if (i == 0) {
+    //    result.x = vel[(i + 1) * ubo.width + j][k] - vel[i * ubo.width + j][k];
+    //}
+    //else if (i == ubo.height - 1) {
+    //    result.x = vel[i * ubo.width + j][k] - vel[(i - 1) * ubo.width + j][k];
+    //}
+    //else {
+    //    result.x = (vel[(i + 1) * ubo.width + j][k] - vel[(i - 1) * ubo.width + j][k]) / 2.0f;
+    //}
+    //if (j == 0) {
+    //    result.y = vel[i * ubo.width + j + 1][k] - vel[i * ubo.width + j][k];
+    //}
+    //else if (j == ubo.width - 1) {
+    //    result.y = vel[i * ubo.width + j][k] - vel[i * ubo.width + j - 1][k];
+    //}
+    //else {
+    //    result.y = (vel[i * ubo.width + j + 1][k] - vel[i * ubo.width + j - 1][k]) / 2.0f;
+    //}
+    return result;
+}
+
+vec3 trilinear(vec3 p, vec3 u[8]) {
+    const float x1=p.x, y1=p.y, z1=p.z, x0=1.0f-x1, y0=1.0f-y1, z0=1.0f-z1; // calculate interpolation factors
+	return (x0*y0*z0)*u[0]+
+           (x1*y0*z0)*u[1]+
+           (x1*y0*z1)*u[2]+
+           (x0*y0*z1)*u[3]+
+           (x0*y1*z0)*u[4]+
+           (x1*y1*z0)*u[5]+
+           (x1*y1*z1)*u[6]+
+           (x0*y1*z1)*u[7]
+    ; // perform trilinear interpolation
+}
+
+vec3 interpolate_u(vec3 pos) {
+    ivec3 corner = ivec3(pos);
+    vec3 factor = pos - corner;
+
+    vec3 u[8];
+    for (uint a = 0; a < 8; ++a) {
+        uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
+        uint x = corner.x + i, y = corner.y + j, z = corner.z + k;
+        u[a] = vel[x + (y + z * ubo.Ny) * ubo.Nx].xyz;
+    }
+    return trilinear(factor, u);
+}
+
+//vec3 particle_boundary_force(vec3 pos) {
+//    ivec3 corner = ivec3(pos);
+//    vec3 factor = pos - corner;
+//
+//    vec3 force = vec3(0.0f);
+//    float distance = 2.0f;
+//    for (uint a = 0; a < 8; ++a) {
+//        uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
+//        uint x = corner.x + i, y = corner.y + j, z = corner.z + k;
+//        if (x == 0 || x == ubo.Nx - 1 || y == 0 || y == ubo.Ny - 1 || z == 0 || z == ubo.Nz - 1) {
+//            force += vec3(0.5f, 0.5f, 0.5f) - vec3(i, j, k);
+//            distance = min(distance, length(vec3(x, y, z) - vec3(i, j, k)));
+//        }
+//    }
+//
+//    float particle_radius = 0.5f;
+//    return distance - 0.5f < particle_radius ? normalize(force) : vec3(0.0f);
+//}
+
+vec3 particle_boundary_force(vec3 pos) {
+    ivec3 lattice = ivec3(pos);
+    vec3 factor = pos - vec3(lattice);
+
+    vec3 force = vec3(0.0f);
+    float distance = 2.0f;
+    for (uint q = 1; q < Q; ++q){
+        ivec3 nb = e[q] + lattice;
+        if (nb.x <= 0 || nb.x >= ubo.Nx - 1) {
+            force.x = lattice.x - nb.x;
+        }
+        if (nb.y <= 0 || nb.y >= ubo.Ny - 1) {
+            force.y = lattice.y - nb.y;
+        }
+        if (nb.z <= 0 || nb.z >= ubo.Nz - 1) {
+            force.z = lattice.z - nb.z;
+        }
+        distance = min(distance, length(vec3(nb + 0.5f) - pos));
+    }
+
+    return length(force) > 1e-6 && distance < 1.0f ? normalize(force) : vec3(0.0f);
+}
+
+void main() 
+{
+    //uint index = gl_GlobalInvocationID.x;
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.particleCount) return;
+
+    Particle particle = particles[index];
+    
+    vec3 pos = particle.position.xyz;
+    vec3 u = interpolate_u(pos); // trilinear interpolation of velocity at point p
+    u = (u + length(u) * particle_boundary_force(pos)); // apply boundary force
+    pos = pos + u; // new position
+
+    particles[index].position = vec4(pos, 0.0f);
+    if (pos.x <= 0 || pos.x >= ubo.Nx - 1 || pos.y <= 0 || pos.y >= ubo.Ny - 1 || pos.z <= 0 || pos.z >= ubo.Nz - 1)
+        particles[index].color = vec4(1.0f, 0.0f, 0.0f, 1.0f);
+}

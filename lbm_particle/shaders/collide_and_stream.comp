@@ -1,0 +1,147 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+#define D 3
+#define Q 19
+float w[Q] = {
+    1.0f /  3.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+};
+
+ivec3 e[Q] = {
+    { 0,  0,  0},
+    { 1,  0,  0},
+    {-1,  0,  0},
+    { 0,  1,  0},
+    { 0, -1,  0},
+    { 0,  0,  1},
+    { 0,  0, -1},
+    { 1,  1,  0},
+    { 1, -1,  0},
+    {-1,  1,  0},
+    {-1, -1,  0},
+    { 1,  0,  1},
+    { 1,  0, -1},
+    {-1,  0,  1},
+    {-1,  0, -1},
+    { 0,  1,  1},
+    { 0,  1, -1},
+    { 0, -1,  1},
+    { 0, -1, -1},
+};
+
+struct vecQ {
+    float f[Q];
+};
+
+vecQ Add(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] + b.f[q];
+    }
+    return result;
+}
+
+vecQ Sub(vecQ a, vecQ b) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = a.f[q] - b.f[q];
+    }
+    return result;
+}
+
+vecQ createVecQ(vec3 u) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = dot(e[q], u);
+    }
+    return result;
+}
+
+vecQ createVecQ(float rho, vecQ eu, float uv) {
+    vecQ result;
+    for (uint q = 0; q < Q; ++q) {
+        result.f[q] = w[q] * rho * (1.0f + 3.0f * eu.f[q] + 4.5f * eu.f[q] * eu.f[q] - 1.5f * uv);
+    }
+    return result;
+}
+
+struct Particle {
+	vec4 position;
+    vec4 color;
+};
+
+layout (std430, binding = 0) uniform SimulateUBO {
+    uint Nx;
+    uint Ny;
+    uint Nz;
+    uint Nxyz;
+    uint particleCount;
+    float niu;
+    float tau;
+    float inv_tau;
+} ubo;
+
+layout(std430, binding = 1) buffer Particles {
+   Particle particles[];
+};
+
+layout(std430, binding = 2) buffer Velocity {
+    vec4 vel[];
+};
+
+layout(std430, binding = 3) buffer Rho {
+    float rho[];
+};
+
+layout(std430, binding = 4) buffer Mask {
+    float mask[];
+};
+
+layout(std430, binding = 5) buffer FOld {
+    vecQ f_old[];
+};
+
+layout(std430, binding = 6) buffer FNew {
+    vecQ f_new[];
+};
+
+vecQ f_eq(uint ijz) {
+    return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
+}
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() 
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
+
+    // index = i + (j + k * ubo.Ny) * ubo.Nx;
+    uint i = index % ubo.Nx, j = (index - i) / ubo.Nx % ubo.Ny, k = index / ubo.Nx / ubo.Ny;
+    
+    if (i < 1 || i >= ubo.Nx - 1 || j < 1 || j >= ubo.Ny - 1 || k < 1 || k >= ubo.Nz - 1) return;
+    for (uint q = 0; q < Q; ++q) {
+        uint ijkp = i - e[q].x + (j - e[q].y + (k - e[q].z) * ubo.Ny) * ubo.Nx;
+        vecQ feq = f_eq(ijkp);
+        f_new[index].f[q] = (1.0f - ubo.inv_tau) * f_old[ijkp].f[q] + ubo.inv_tau * feq.f[q];
+    }
+}
