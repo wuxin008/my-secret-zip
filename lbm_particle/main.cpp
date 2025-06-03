@@ -783,7 +783,7 @@ private:
 
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        createInfo.pNext = &atomicFloatFeatures;
+        //createInfo.pNext = &atomicFloatFeatures;
         createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
         createInfo.pEnabledFeatures = &deviceFeatures;
@@ -2642,7 +2642,7 @@ private:
             ubo.Nz = Nz;
             ubo.Nxyz = Nxyz;
             ubo.particleCount = particle_count;
-            ubo.particleRho = 1.0f;
+            ubo.particleRho = 10.0f;
             ubo.niu = 0.000001f;
             ubo.tau = 3.0f * ubo.niu + 0.5f;
             ubo.inv_tau = 1.0f / ubo.tau;
@@ -2967,6 +2967,9 @@ private:
 
         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
         vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, availableExtensions.data());
+        for (uint i = 0; i < extensionCount; ++i) {
+            std::cout << availableExtensions[i].extensionName << std::endl;
+        }
 
         std::set<std::string> requiredExtensions(deviceExtensions.begin(), deviceExtensions.end());
 

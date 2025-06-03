@@ -3,6 +3,7 @@
 
 #define D 3
 #define Q 19
+#define SCALE 1e10
 #define def_c 0.57735027f
 
 #define def_w0 (1.0f/3.0f ) // center (0)
@@ -114,7 +115,7 @@ layout(std430, binding = 5) buffer DDF {
 };
 
 layout(std430, binding = 6) buffer BorderForce {
-    float bfs[];
+    int bfs[];
 };
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -258,9 +259,9 @@ void main()
     
     // FORCE_FIELD
     { // separate block to avoid variable name conflicts
-		fxn += bfs[            index]; // apply force field
-		fyn += bfs[   ubo.Nxyz+index];
-		fzn += bfs[2u*ubo.Nxyz+index];
+		fxn += float(bfs[            index]) / SCALE; // apply force field
+		fyn += float(bfs[   ubo.Nxyz+index]) / SCALE;
+		fzn += float(bfs[2u*ubo.Nxyz+index]) / SCALE;
 	}
 
     // VOLUME_FORCE

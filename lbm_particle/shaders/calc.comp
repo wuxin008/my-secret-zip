@@ -1,9 +1,11 @@
 #version 450
 #extension GL_EXT_scalar_block_layout : require
-#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_debug_printf : require
 
 #define D 3
 #define Q 19
+#define SCALE 1e10
 #define def_c 0.57735027f
 
 #define def_w0 (1.0f/3.0f ) // center (0)
@@ -115,7 +117,7 @@ layout(std430, binding = 5) buffer DDF {
 };
 
 layout(std430, binding = 6) buffer BorderForce {
-    float bfs[];
+    int bfs[];
 };
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -314,7 +316,8 @@ vec3 particle_boundary_force(vec3 pos) {
 //    float old = val; while((old=atomicExchange(bfs[n], atomicExchange(bfs[n], 0.0f)+old))!=0.0f);
 //}
 
-void atomicAdd(const uint n, const float val) {
+void atomicAdd(const uint n, const int val) {
+    if (val != 0) debugPrintfEXT("index: %d, val: %d", n, val);
     atomicAdd(bfs[n], val);
 }
 
@@ -327,9 +330,11 @@ void spread_force(vec3 p, vec3 Fn) {
         uint x = lattice.x + i, y = lattice.y + j, z = lattice.z + k;
         uint n = x + (y + z * ubo.Ny) * ubo.Nx;
         const float d = (1.0f-abs(factor.x-float(i)))*(1.0f-abs(factor.y-float(j)))*(1.0f-abs(factor.z-float(k)));
-        atomicAdd(            uint(n), Fn.x*d); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
-        atomicAdd(   ubo.Nxyz+uint(n), Fn.y*d); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
-        atomicAdd(2u*ubo.Nxyz+uint(n), Fn.z*d); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
+        
+        //debugPrintfEXT("Fn.x: %f, Fn.y: %f, Fn.z: %f, f: %f", Fn.x, Fn.y, Fn.z, d);
+        atomicAdd(            uint(n), int(Fn.x*d * SCALE)); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
+        atomicAdd(   ubo.Nxyz+uint(n), int(Fn.y*d * SCALE)); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
+        atomicAdd(2u*ubo.Nxyz+uint(n), int(Fn.z*d * SCALE)); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
     }
 }
 
