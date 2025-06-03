@@ -128,7 +128,7 @@ int c(const uint i) {
 }
 
 float sq(float x) {
-    return x * x;
+    return pow(x, 2);
 }
 
 uvec3 coordinates(const uint n) { // disassemble 1D index to 3D coordinates (n -> x,y,z)
@@ -189,7 +189,7 @@ void apply_moving_boundaries(inout float fhn[Q], const uint nbs[Q]) {
 	}
 }
 
-void calculate_rho_u(const float f[Q], inout float rhon, inout float uxn, inout float uyn, inout float uzn) {
+void calculate_rho_u(float f[Q], inout float rhon, inout float uxn, inout float uyn, inout float uzn) {
     float rho=f[0], ux, uy, uz;
     for(uint q=1u; q<Q; q++) rho += f[q]; // calculate density from fi
 	rho += 1.0f; // add 1.0f last to avoid digit extinction effects when summing up fi (perturbation method / DDF-shifting)
@@ -202,15 +202,15 @@ void calculate_rho_u(const float f[Q], inout float rhon, inout float uxn, inout 
     uzn = uz/rho;
 }
 
-void calculate_forcing_terms(const float ux, const float uy, const float uz, const float fx, const float fy, const float fz, inout float Fin[Q]) {
+void calculate_forcing_terms(float ux, float uy, float uz, float fx, float fy, float fz, inout float Fin[Q]) {
     const float uF = -0.33333334f*fma(ux, fx, fma(uy, fy, uz*fz)); // 3D
-    Fin[0] = 9.0f*def_w0*uF ; // 000 (identical for all velocity sets)
+    Fin[0] = 9.0f*w[0]*uF ; // 000 (identical for all velocity sets)
 	for(uint q=1u; q<Q; q++) { // loop is entirely unrolled by compiler, no unnecessary FLOPs are happening
 		Fin[q] = 9.0f*w[q]*fma(c(q)*fx+c(Q+q)*fy+c(2u*Q+q)*fz, c(q)*ux+c(Q+q)*uy+c(2u*Q+q)*uz+0.33333334f, uF);
 	}
 }
 
-void calculate_f_eq(const float rho, float ux, float uy, float uz, inout float feq[Q]) {
+void calculate_f_eq(float rho, float ux, float uy, float uz, inout float feq[Q]) {
     const float rhom1 = rho-1.0f; // rhom1 is arithmetic optimization to minimize digit extinction
     const float c3 = -3.0f*(sq(ux)+sq(uy)+sq(uz)); // c3 = -2*sq(u)/(2*sq(c))
 	uz *= 3.0f; // only needed for 3D
@@ -230,76 +230,39 @@ void calculate_f_eq(const float rho, float ux, float uy, float uz, inout float f
 	feq[17] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), u5), rhom1e); feq[18] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), -u5), rhom1e); // 0+- 0-+
 }
 
-void main() 
+void main()
 {
     uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
     uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
     if (index >= ubo.Nxyz) return;
-    
-    uint flagsn = flags[index]; // cache flags[n] for multiple readings
-	uint flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
-	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // if cell is solid boundary or gas, just return
-    
-    uint nbs[Q];
-    neighbors(index, nbs);
-    
-    float fhn[Q];
-    load_f(index, fhn, nbs, ubo.t); // perform streaming (part 2);
 
-    if (flagsn == TYPE_MS) { // MOVING_BOUNDARIES
-        apply_moving_boundaries(fhn, nbs); // apply Dirichlet velocity boundaries if necessary (reads velocities of only neighboring boundary cells, which do not change during simulation)
-    }
-    
-    float rhon, uxn, uyn, uzn; // calculate local density and velocity for collision
-    calculate_rho_u(fhn, rhon, uxn, uyn, uzn); // calculate density and velocity fields from fi
-    
-    float fxn=ubo.fx, fyn=ubo.fy, fzn=ubo.fz; // force starts as constant volume force, can be modified before call of calculate_forcing_terms(...)
-    float Fin[Q]; // forcing terms
-    
-    // FORCE_FIELD
-    { // separate block to avoid variable name conflicts
-		fxn += bfs[            index]; // apply force field
-		fyn += bfs[   ubo.Nxyz+index];
-		fzn += bfs[2u*ubo.Nxyz+index];
-	}
+    uint flagsn = flags[index];
+    uint flagsn_bo = flagsn & TYPE_BO; // extract boundary flags
 
-    // VOLUME_FORCE
-    {
-        const float rho2 = 0.5f/rhon; // apply external volume force (Guo forcing, Krueger p.233f)
-		uxn = clamp(fma(fxn, rho2, uxn), -def_c, def_c); // limit velocity (for stability purposes)
-		uyn = clamp(fma(fyn, rho2, uyn), -def_c, def_c); // force term: F*dt/(2*rho)
-		uzn = clamp(fma(fzn, rho2, uzn), -def_c, def_c);
-		calculate_forcing_terms(uxn, uyn, uzn, fxn, fyn, fzn, Fin); // calculate volume force terms Fin from velocity field (Guo forcing, Krueger p.233f)
-    }
+    uint nbs[Q]; // neighbor indices
+    neighbors(index, nbs); // calculate neighbor indices
 
-    // NO EQUILIBRIUM BOUNDARIES
-    rhos[            index] = rhon; // update density field
-    vels[            index] = uxn; // update velocity field
-    vels[   ubo.Nxyz+index] = uyn;
-    vels[2u*ubo.Nxyz+index] = uzn;
-    
-    float feq[Q]; // equilibrium DDFs
-    calculate_f_eq(rhon, uxn, uyn, uzn, feq); // calculate equilibrium DDFs
-    float w = ubo.tau; // LBM relaxation rate w = dt/tau = dt/(nu/c^2+dt/2) = 1/(3*nu+1/2)
-    
-    // SUBGRID
-    { // Smagorinsky-Lilly subgrid turbulence model, source: https://arxiv.org/pdf/comp-gas/9401004.pdf, in the eq. below (26), it is "tau_0" not "nu_0", and "sqrt(2)/rho" (they call "rho" "n") is missing
-		const float tau0 = 1.0f/w; // source 2: https://youtu.be/V8ydRrdCzl0
-		float Hxx=0.0f, Hyy=0.0f, Hzz=0.0f, Hxy=0.0f, Hxz=0.0f, Hyz=0.0f; // non-equilibrium stress tensor
-		for(uint q=1u; q<Q; q++) {
-			const float fneqi = fhn[q]-feq[q];
-			const float cxi=c(q), cyi=c(Q+q), czi=c(2u*Q+q);
-			Hxx += cxi*cxi*fneqi; //Hyx += cyi*cxi*fneqi; Hzx += czi*cxi*fneqi; // symmetric tensor
-			Hxy += cxi*cyi*fneqi; Hyy += cyi*cyi*fneqi; //Hzy += czi*cyi*fneqi;
-			Hxz += cxi*czi*fneqi; Hyz += cyi*czi*fneqi; Hzz += czi*czi*fneqi;
+    uint nbflags[Q]; // cache neighbor flags for multiple readings
+    for(uint q=1u; q<Q; q++) nbflags[q] = flags[nbs[q]];
+
+    if(flagsn_bo==TYPE_S) { // cell is solid
+		bool TYPE_ONLY_S = true; // has only solid neighbors
+		for(uint q=1u; q<Q; q++) TYPE_ONLY_S = TYPE_ONLY_S&&(nbflags[q]&TYPE_BO)==TYPE_S;
+		if(TYPE_ONLY_S) {
+			vels[            index] = 0.0f; // reset velocity for solid lattice points with only boundary neighbors
+			vels[   ubo.Nxyz+index] = 0.0f;
+			vels[2u*ubo.Nxyz+index] = 0.0f;
 		}
-		const float Q0 = sq(Hxx)+sq(Hyy)+sq(Hzz)+2.0f*(sq(Hxy)+sq(Hxz)+sq(Hyz)); // Q = H*H, turbulent eddy viscosity nut = (C*Delta)^2*|S|, intensity of local strain rate tensor |S|=sqrt(2*S*S)
-		//w = 2.0f/(tau0+sqrt(sq(tau0)+0.76421222f*sqrt(Q0)/rhon)); // 0.76421222 = 18*sqrt(2)*(C*Delta)^2, C = 1/pi*(2/(3*CK))^(3/4) = Smagorinsky-Lilly constant, CK = 3/2 = Kolmogorov constant, Delta = 1 = lattice constant
-	} // modity LBM relaxation rate by increasing effective viscosity in regions of high strain rate (add turbulent eddy viscosity), nu_eff = nu_0+nu_t
-    
-    const float c_tau = fma(w, -0.5f, 1.0f);
-	for(uint q=0u; q<Q; q++) Fin[q] *= c_tau;
-    for(uint q=0u; q<Q; q++) fhn[q] = fma(1.0f-w, fhn[q], fma(w, feq[q], Fin[q])); // perform collision (SRT)
+    }else if (flagsn_bo!=TYPE_E) {
+        bool next_to_moving_boundary = false;
+		for(uint q=1u; q<Q; q++) {
+			next_to_moving_boundary = next_to_moving_boundary||((nbflags[q]&TYPE_BO)==TYPE_S&&(vels[nbs[q]]!=0.0f||vels[ubo.Nxyz+nbs[q]]!=0.0f||vels[2u*ubo.Nxyz+nbs[q]]!=0.0f));
+		}
+		flags[index] = flagsn = next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_MS; // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+    }
 
-    store_f(index, fhn, nbs, ubo.t); // perform streaming (part 1)
+    float feq[Q]; // f_equilibrium
+	calculate_f_eq(rhos[index], vels[index], vels[ubo.Nxyz+index], vels[2u*ubo.Nxyz+index], feq);
+
+    store_f(index, feq, nbs, 1u); // write to fi
 }

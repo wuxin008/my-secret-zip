@@ -1,8 +1,34 @@
 #version 450
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_atomic_float : enable
 
 #define D 3
 #define Q 19
+#define def_c 0.57735027f
+
+#define def_w0 (1.0f/3.0f ) // center (0)
+#define def_ws (1.0f/18.0f) // straight (1-6)
+#define def_we (1.0f/36.0f) // edge (7-18)
+
+#define TYPE_S  0x01 // 0b00000001 // (stationary or moving) solid boundary
+#define TYPE_E  0x02 // 0b00000010 // equilibrium boundary (inflow/outflow)
+#define TYPE_T  0x04 // 0b00000100 // temperature boundary
+#define TYPE_F  0x08 // 0b00001000 // fluid
+#define TYPE_I  0x10 // 0b00010000 // interface
+#define TYPE_G  0x20 // 0b00100000 // gas
+#define TYPE_X  0x40 // 0b01000000 // reserved type X
+#define TYPE_Y  0x80 // 0b10000000 // reserved type Y
+
+#define TYPE_MS 0x03 // 0b00000011 // cell next to moving solid boundary
+#define TYPE_BO 0x03 // 0b00000011 // any flag bit used for boundaries (temperature excluded)
+#define TYPE_IF 0x18 // 0b00011000 // change from interface to fluid
+#define TYPE_IG 0x30 // 0b00110000 // change from interface to gas
+#define TYPE_GI 0x38 // 0b00111000 // change from gas to interface
+#define TYPE_SU 0x38 // 0b00111000 // any flag bit used for SURFACE
+
+#define fma(a, b, c) ((a)*(b)+(c))
+#define load(p,o) p[o]
+#define store(p,o,x) p[o]=x
 float w[Q] = {
     1.0f /  3.0f,
     1.0f / 18.0f,
@@ -34,54 +60,18 @@ ivec3 e[Q] = {
     { 0,  0,  1},
     { 0,  0, -1},
     { 1,  1,  0},
-    { 1, -1,  0},
-    {-1,  1,  0},
     {-1, -1,  0},
     { 1,  0,  1},
-    { 1,  0, -1},
-    {-1,  0,  1},
     {-1,  0, -1},
     { 0,  1,  1},
+    { 0, -1, -1},
+    { 1, -1,  0},
+    {-1,  1,  0},
+    { 1,  0, -1},
+    {-1,  0,  1},
     { 0,  1, -1},
     { 0, -1,  1},
-    { 0, -1, -1},
 };
-
-struct vecQ {
-    float f[Q];
-};
-
-vecQ Add(vecQ a, vecQ b) {
-    vecQ result;
-    for (uint q = 0; q < Q; ++q) {
-        result.f[q] = a.f[q] + b.f[q];
-    }
-    return result;
-}
-
-vecQ Sub(vecQ a, vecQ b) {
-    vecQ result;
-    for (uint q = 0; q < Q; ++q) {
-        result.f[q] = a.f[q] - b.f[q];
-    }
-    return result;
-}
-
-vecQ createVecQ(vec3 u) {
-    vecQ result;
-    for (uint q = 0; q < Q; ++q) {
-        result.f[q] = dot(e[q], u);
-    }
-    return result;
-}
-
-vecQ createVecQ(float rho, vecQ eu, float uv) {
-    vecQ result;
-    for (uint q = 0; q < Q; ++q) {
-        result.f[q] = w[q] * rho * (1.0f + 3.0f * eu.f[q] + 4.5f * eu.f[q] * eu.f[q] - 1.5f * uv);
-    }
-    return result;
-}
 
 struct Particle {
 	vec4 position;
@@ -94,9 +84,14 @@ layout (std430, binding = 0) uniform SimulateUBO {
     uint Nz;
     uint Nxyz;
     uint particleCount;
+    float particleRho;
     float niu;
     float tau;
     float inv_tau;
+    float fx;
+    float fy;
+    float fz;
+    uint t;
 } ubo;
 
 layout(std430, binding = 1) buffer Particles {
@@ -104,144 +99,193 @@ layout(std430, binding = 1) buffer Particles {
 };
 
 layout(std430, binding = 2) buffer Velocity {
-    vec4 vel[];
+    float vels[];
 };
 
 layout(std430, binding = 3) buffer Rho {
-    float rho[];
+    float rhos[];
 };
 
-layout(std430, binding = 4) buffer Mask {
-    float mask[];
+layout(std430, binding = 4) buffer Flag {
+    uint flags[];
 };
 
-layout(std430, binding = 5) buffer FOld {
-    vecQ f_old[];
+layout(std430, binding = 5) buffer DDF {
+    float ddfs[];
 };
 
-layout(std430, binding = 6) buffer FNew {
-    vecQ f_new[];
+layout(std430, binding = 6) buffer BorderForce {
+    float bfs[];
 };
-
-vecQ f_eq(uint ijz) {
-    return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
-}
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-vec4 plasma(float t) {
-    t = clamp(t, 0.0, 1.0);
-    
-    // 关键颜色点（来自Matplotlib的plasma数据）
-    const vec4 c0 = vec4(0.050383, 0.029803, 0.527975, 1.0); // t=0.0
-    const vec4 c1 = vec4(0.529414, 0.026526, 0.625659, 1.0); // t≈0.25
-    const vec4 c2 = vec4(0.920492, 0.383213, 0.298564, 1.0); // t≈0.5
-    const vec4 c3 = vec4(0.988474, 0.644367, 0.145109, 1.0); // t≈0.75
-    const vec4 c4 = vec4(0.940015, 0.975158, 0.131326, 1.0); // t=1.0
-    
-    // 分段线性插值
-    if (t < 0.25) {
-        return mix(c0, c1, t / 0.25);
-    } else if (t < 0.5) {
-        return mix(c1, c2, (t - 0.25) / 0.25);
-    } else if (t < 0.75) {
-        return mix(c2, c3, (t - 0.5) / 0.25);
-    } else {
-        return mix(c3, c4, (t - 0.75) / 0.25);
-    }
+uint index_f(uint n, uint i) {
+    return i * ubo.Nxyz + n;
 }
 
-vec4 colorMap(float t) {
-    t = clamp(t, -1.0, 1.0);
-    
-    // 关键颜色点（来自Matplotlib的plasma数据）
-    const vec4 c0 = vec4(1.0, 1.0, 0.0, 1.0); // t=0.0
-    const vec4 c1 = vec4(0.953, 0.490, 0.016, 1.0); // t≈0.25
-    const vec4 c2 = vec4(0.0, 0.0, 0.0, 1.0); // t≈0.5
-    const vec4 c3 = vec4(0.176, 0.976, 0.529, 1.0); // t≈0.75
-    const vec4 c4 = vec4(0.0, 1.0, 1.0, 1.0); // t=1.0
-    
-    // 分段线性插值
-    if (t < -0.5f) {
-        return mix(c0, c1, (t + 1.0f) * 2);
-    } else if (t < 0.00f) {
-        return mix(c1, c2, (t + 0.5f) * 2);
-    } else if (t < 0.5f) {
-        return mix(c2, c3, t * 2);
-    } else {
-        return mix(c3, c4, (t - 0.5f) * 2);
-    }
+int c(const uint i) {
+    return e[i % Q][i / Q];
 }
 
-vec2 gradient(uint i, uint j, uint k) {
-    uint index = i + (j + k * ubo.Ny) * ubo.Nx;
-
-    vec2 result;
-    //if (i == 0) {
-    //    result.x = vel[(i + 1) * ubo.width + j][k] - vel[i * ubo.width + j][k];
-    //}
-    //else if (i == ubo.height - 1) {
-    //    result.x = vel[i * ubo.width + j][k] - vel[(i - 1) * ubo.width + j][k];
-    //}
-    //else {
-    //    result.x = (vel[(i + 1) * ubo.width + j][k] - vel[(i - 1) * ubo.width + j][k]) / 2.0f;
-    //}
-    //if (j == 0) {
-    //    result.y = vel[i * ubo.width + j + 1][k] - vel[i * ubo.width + j][k];
-    //}
-    //else if (j == ubo.width - 1) {
-    //    result.y = vel[i * ubo.width + j][k] - vel[i * ubo.width + j - 1][k];
-    //}
-    //else {
-    //    result.y = (vel[i * ubo.width + j + 1][k] - vel[i * ubo.width + j - 1][k]) / 2.0f;
-    //}
-    return result;
+float sq(float x) {
+    return pow(x, 2);
 }
 
-vec3 trilinear(vec3 p, vec3 u[8]) {
-    const float x1=p.x, y1=p.y, z1=p.z, x0=1.0f-x1, y0=1.0f-y1, z0=1.0f-z1; // calculate interpolation factors
-	return (x0*y0*z0)*u[0]+
-           (x1*y0*z0)*u[1]+
-           (x1*y0*z1)*u[2]+
-           (x0*y0*z1)*u[3]+
-           (x0*y1*z0)*u[4]+
-           (x1*y1*z0)*u[5]+
-           (x1*y1*z1)*u[6]+
-           (x0*y1*z1)*u[7]
-    ; // perform trilinear interpolation
+uvec3 coordinates(const uint n) { // disassemble 1D index to 3D coordinates (n -> x,y,z)
+	const uint t = uint(n%(ubo.Nx*ubo.Ny));
+	return uvec3(t%ubo.Nx, t/ubo.Nx, uint(n/(ubo.Nx*ubo.Ny))); // n = x+(y+z*Ny)*Nx
 }
+
+void calculate_indices(uint n, inout uint x0, inout uint xp, inout uint xm, inout uint y0, inout uint yp, inout uint ym, inout uint z0, inout uint zp, inout uint zm) {
+    const uvec3 xyz = coordinates(n);
+	x0 = uint(    xyz.x                                        ); // pre-calculate indices (periodic boundary conditions)
+	xp = uint(  ((xyz.x       +1u)%ubo.Nx)                     );
+	xm = uint(  ((xyz.x+ubo.Nx-1u)%ubo.Nx)                     );
+	y0 = uint(   (xyz.y                   *ubo.Nx)             );
+	yp = uint( (((xyz.y       +1u)%ubo.Ny)*ubo.Nx)             );
+	ym = uint( (((xyz.y+ubo.Ny-1u)%ubo.Ny)*ubo.Nx)             );
+	z0 = uint(    xyz.z                   *uint(ubo.Ny*ubo.Nx) );
+	zp = uint(  ((xyz.z       +1u)%ubo.Nz)*uint(ubo.Ny*ubo.Nx) );
+	zm = uint(  ((xyz.z+ubo.Nz-1u)%ubo.Nz)*uint(ubo.Ny*ubo.Nx) );
+}
+
+void neighbors(uint index, inout uint nbs[Q]) {
+    uint x0, xp, xm, y0, yp, ym, z0, zp, zm;
+	calculate_indices(index, x0, xp, xm, y0, yp, ym, z0, zp, zm);
+	nbs[ 0] = index;
+    nbs[ 1] = xp+y0+z0; nbs[ 2] = xm+y0+z0; // +00 -00
+	nbs[ 3] = x0+yp+z0; nbs[ 4] = x0+ym+z0; // 0+0 0-0
+	nbs[ 5] = x0+y0+zp; nbs[ 6] = x0+y0+zm; // 00+ 00-
+	nbs[ 7] = xp+yp+z0; nbs[ 8] = xm+ym+z0; // ++0 --0
+	nbs[ 9] = xp+y0+zp; nbs[10] = xm+y0+zm; // +0+ -0-
+	nbs[11] = x0+yp+zp; nbs[12] = x0+ym+zm; // 0++ 0--
+	nbs[13] = xp+ym+z0; nbs[14] = xm+yp+z0; // +-0 -+0
+	nbs[15] = xp+y0+zm; nbs[16] = xm+y0+zp; // +0- -0+
+	nbs[17] = x0+yp+zm; nbs[18] = x0+ym+zp; // 0+- 0-+
+}
+
+void load_f(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+    fhn[0] = load(ddfs, index_f(n, 0u)); // Esoteric-Pull
+	for(uint q = 1u; q < Q; q += 2u) {
+		fhn[q   ] = load(ddfs, index_f(n     , t%2u!=0 ? q    : q+1u));
+		fhn[q+1u] = load(ddfs, index_f(nbs[q], t%2u!=0 ? q+1u : q   ));
+	}
+}
+
+void store_f(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+    store(ddfs, index_f(n, 0u), fhn[0]); // Esoteric-Pull
+	for(uint q = 1u; q < Q; q += 2u) {
+		store(ddfs, index_f(n     , t%2u!=0 ? q    : q+1u), fhn[q+1u]);
+		store(ddfs, index_f(nbs[q], t%2u!=0 ? q+1u : q   ), fhn[q   ]);
+	}
+}
+
+void apply_moving_boundaries(inout float fhn[Q], const uint nbs[Q]) {
+    uint ji; // reads velocities of only neighboring boundary cells, which do not change during simulation
+	for(uint q = 1u; q < Q; q += 2u) { // loop is entirely unrolled by compiler, no unnecessary memory access is happening
+		float w6 = -6.0f*w[q]; // w6 = -2*w_i*rho_wall/c^2, w(i) = w(i+1) if i is odd, rho_wall is assumed as rho_avg=1 (necessary choice to assure mass conservation)
+		ji = nbs[q+1u]; fhn[q   ] = (flags[ji]&TYPE_BO)==TYPE_S ? fma(w6, c(q+1u)*vels[ji]+c(Q+q+1u)*vels[ubo.Nxyz+ji]+c(2u*Q+q+1u)*vels[2u*ubo.Nxyz+ji], fhn[q   ]) : fhn[q   ]; // boundary : regular
+		ji = nbs[q   ]; fhn[q+1u] = (flags[ji]&TYPE_BO)==TYPE_S ? fma(w6, c(q   )*vels[ji]+c(Q+q   )*vels[ubo.Nxyz+ji]+c(2u*Q+q   )*vels[2u*ubo.Nxyz+ji], fhn[q+1u]) : fhn[q+1u];
+	}
+}
+
+void calculate_rho_u(const float f[Q], inout float rhon, inout float uxn, inout float uyn, inout float uzn) {
+    float rho=f[0], ux, uy, uz;
+    for(uint q=1u; q<Q; q++) rho += f[q]; // calculate density from fi
+	rho += 1.0f; // add 1.0f last to avoid digit extinction effects when summing up fi (perturbation method / DDF-shifting)
+    ux = f[ 1]-f[ 2]+f[ 7]-f[ 8]+f[ 9]-f[10]+f[13]-f[14]+f[15]-f[16];
+    uy = f[ 3]-f[ 4]+f[ 7]-f[ 8]+f[11]-f[12]+f[14]-f[13]+f[17]-f[18];
+    uz = f[ 5]-f[ 6]+f[ 9]-f[10]+f[11]-f[12]+f[16]-f[15]+f[18]-f[17];
+    rhon = rho;
+    uxn = ux/rho;
+    uyn = uy/rho;
+    uzn = uz/rho;
+}
+
+void calculate_forcing_terms(const float ux, const float uy, const float uz, const float fx, const float fy, const float fz, inout float Fin[Q]) {
+    const float uF = -0.33333334f*fma(ux, fx, fma(uy, fy, uz*fz)); // 3D
+    Fin[0] = 9.0f*def_w0*uF ; // 000 (identical for all velocity sets)
+	for(uint q=1u; q<Q; q++) { // loop is entirely unrolled by compiler, no unnecessary FLOPs are happening
+		Fin[q] = 9.0f*w[q]*fma(c(q)*fx+c(Q+q)*fy+c(2u*Q+q)*fz, c(q)*ux+c(Q+q)*uy+c(2u*Q+q)*uz+0.33333334f, uF);
+	}
+}
+
+void calculate_f_eq(float rho, float ux, float uy, float uz, inout float feq[Q]) {
+    const float rhom1 = rho-1.0f; // rhom1 is arithmetic optimization to minimize digit extinction
+    const float c3 = -3.0f*(sq(ux)+sq(uy)+sq(uz)); // c3 = -2*sq(u)/(2*sq(c))
+	uz *= 3.0f; // only needed for 3D
+    ux *= 3.0f;
+	uy *= 3.0f;
+	feq[ 0] = w[0]*fma(rho, 0.5f*c3, rhom1); // 000 (identical for all velocity sets)
+    const float u0=ux+uy, u1=ux+uz, u2=uy+uz, u3=ux-uy, u4=ux-uz, u5=uy-uz;
+	const float rhos=def_ws*rho, rhoe=def_we*rho, rhom1s=def_ws*rhom1, rhom1e=def_we*rhom1;
+	feq[ 1] = fma(rhos, fma(0.5f, fma(ux, ux, c3), ux), rhom1s); feq[ 2] = fma(rhos, fma(0.5f, fma(ux, ux, c3), -ux), rhom1s); // +00 -00
+	feq[ 3] = fma(rhos, fma(0.5f, fma(uy, uy, c3), uy), rhom1s); feq[ 4] = fma(rhos, fma(0.5f, fma(uy, uy, c3), -uy), rhom1s); // 0+0 0-0
+	feq[ 5] = fma(rhos, fma(0.5f, fma(uz, uz, c3), uz), rhom1s); feq[ 6] = fma(rhos, fma(0.5f, fma(uz, uz, c3), -uz), rhom1s); // 00+ 00-
+	feq[ 7] = fma(rhoe, fma(0.5f, fma(u0, u0, c3), u0), rhom1e); feq[ 8] = fma(rhoe, fma(0.5f, fma(u0, u0, c3), -u0), rhom1e); // ++0 --0
+	feq[ 9] = fma(rhoe, fma(0.5f, fma(u1, u1, c3), u1), rhom1e); feq[10] = fma(rhoe, fma(0.5f, fma(u1, u1, c3), -u1), rhom1e); // +0+ -0-
+	feq[11] = fma(rhoe, fma(0.5f, fma(u2, u2, c3), u2), rhom1e); feq[12] = fma(rhoe, fma(0.5f, fma(u2, u2, c3), -u2), rhom1e); // 0++ 0--
+	feq[13] = fma(rhoe, fma(0.5f, fma(u3, u3, c3), u3), rhom1e); feq[14] = fma(rhoe, fma(0.5f, fma(u3, u3, c3), -u3), rhom1e); // +-0 -+0
+	feq[15] = fma(rhoe, fma(0.5f, fma(u4, u4, c3), u4), rhom1e); feq[16] = fma(rhoe, fma(0.5f, fma(u4, u4, c3), -u4), rhom1e); // +0- -0+
+	feq[17] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), u5), rhom1e); feq[18] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), -u5), rhom1e); // 0+- 0-+
+}
+
+vec3 trilinear3(const vec3 p, const vec3 v[8]) { // trilinear interpolation, p: position in unit cube, v: corner vectors in unit cube
+	const float x1=p.x, y1=p.y, z1=p.z, x0=1.0f-x1, y0=1.0f-y1, z0=1.0f-z1; // calculate interpolation factors
+	return (x0*y0*z0)*v[0]+(x1*y0*z0)*v[1]+(x1*y0*z1)*v[2]+(x0*y0*z1)*v[3]+(x0*y1*z0)*v[4]+(x1*y1*z0)*v[5]+(x1*y1*z1)*v[6]+(x0*y1*z1)*v[7]; // perform trilinear interpolation
+}
+
+vec3 load3(uint n) {
+    return vec3(vels[n], vels[n + ubo.Nxyz], vels[n + 2u*ubo.Nxyz]);
+}
+
+//vec3 interpolate_u(const vec3 p) { // trilinear interpolation of velocity at point p
+//	const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//	const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//	const vec3 pn = vec3(xa-float(xb), ya-float(yb), za-float(zb)); // calculate interpolation factors
+//	vec3 un[8]; // velocitiy at unit cube corner points
+//	for(uint c=0u; c<8u; c++) { // count over eight corner points
+//		const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//		const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//		const uint n = uint(x)+uint(y+z*ubo.Ny)*uint(ubo.Nx); // calculate lattice linear index
+//		un[c] = load3(n); // load velocity from lattice point
+//	}
+//	return trilinear3(pn, un); // perform trilinear interpolation
+//}
 
 vec3 interpolate_u(vec3 pos) {
-    ivec3 corner = ivec3(pos);
-    vec3 factor = pos - corner;
+    ivec3 lattice = ivec3(pos);
+    vec3 factor = pos - lattice;
 
     vec3 u[8];
     for (uint a = 0; a < 8; ++a) {
         uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
-        uint x = corner.x + i, y = corner.y + j, z = corner.z + k;
-        u[a] = vel[x + (y + z * ubo.Ny) * ubo.Nx].xyz;
+        uint x = lattice.x + i, y = lattice.y + j, z = lattice.z + k;
+        uint n = x + (y + z * ubo.Ny) * ubo.Nx;
+        u[a] = vec3(vels[n], vels[n + ubo.Nxyz], vels[n + 2u * ubo.Nxyz]);
     }
-    return trilinear(factor, u);
+    return trilinear3(factor, u);
 }
 
-//vec3 particle_boundary_force(vec3 pos) {
-//    ivec3 corner = ivec3(pos);
-//    vec3 factor = pos - corner;
-//
-//    vec3 force = vec3(0.0f);
-//    float distance = 2.0f;
-//    for (uint a = 0; a < 8; ++a) {
-//        uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
-//        uint x = corner.x + i, y = corner.y + j, z = corner.z + k;
-//        if (x == 0 || x == ubo.Nx - 1 || y == 0 || y == ubo.Ny - 1 || z == 0 || z == ubo.Nz - 1) {
-//            force += vec3(0.5f, 0.5f, 0.5f) - vec3(i, j, k);
-//            distance = min(distance, length(vec3(x, y, z) - vec3(i, j, k)));
-//        }
-//    }
-//
-//    float particle_radius = 0.5f;
-//    return distance - 0.5f < particle_radius ? normalize(force) : vec3(0.0f);
-//}
+//vec3 particle_boundary_force(const vec3 p) { // normalized pseudo-force to prevent particles from entering solid boundaries or exiting fluid phase
+//	const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//	const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//	const float x1=xa-float(xb), y1=ya-float(yb), z1=za-float(zb); // calculate interpolation factors
+//	vec3 boundary_force = vec3(0.0f, 0.0f, 0.0f);
+//	float boundary_distance = 2.0f;
+//	for(uint c=0u; c<8u; c++) { // count over eight corner points
+//		const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//		const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//		const uint n = uint(x)+uint(y+z*ubo.Ny)+uint(ubo.Nx); // calculate lattice linear index
+//		if((flags[n]&(TYPE_S|TYPE_G)) != 0) {
+//			boundary_force += vec3(0.5f, 0.5f, 0.5f)-vec3(i, j, k);
+//			boundary_distance = min(boundary_distance, length(vec3(x1, y1, z1)-vec3(i, j, k)));
+//		}
+//	}
+//	const float particle_radius = 0.5f; // has to be between 0.0f and 0.5f, default: 0.5f (hydrodynamic radius)
+//	return length(boundary_force) > 1e-6 && boundary_distance-0.5f<particle_radius ? normalize(boundary_force) : vec3(0.0f, 0.0f, 0.0f);
+//} // particle_boundary_force()
 
 vec3 particle_boundary_force(vec3 pos) {
     ivec3 lattice = ivec3(pos);
@@ -266,21 +310,63 @@ vec3 particle_boundary_force(vec3 pos) {
     return length(force) > 1e-6 && distance < 1.0f ? normalize(force) : vec3(0.0f);
 }
 
+//void atomicAdd(const uint n, const float val) {
+//    float old = val; while((old=atomicExchange(bfs[n], atomicExchange(bfs[n], 0.0f)+old))!=0.0f);
+//}
+
+void atomicAdd(const uint n, const float val) {
+    atomicAdd(bfs[n], val);
+}
+
+void spread_force(vec3 p, vec3 Fn) {
+    ivec3 lattice = ivec3(p);
+    vec3 factor = p - lattice;
+
+    for (uint a = 0; a < 8; ++a) {
+        uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
+        uint x = lattice.x + i, y = lattice.y + j, z = lattice.z + k;
+        uint n = x + (y + z * ubo.Ny) * ubo.Nx;
+        const float d = (1.0f-abs(factor.x-float(i)))*(1.0f-abs(factor.y-float(j)))*(1.0f-abs(factor.z-float(k)));
+        atomicAdd(            uint(n), Fn.x*d); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
+        atomicAdd(   ubo.Nxyz+uint(n), Fn.y*d); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
+        atomicAdd(2u*ubo.Nxyz+uint(n), Fn.z*d); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
+    }
+}
+
+//void spread_force(vec3 p, vec3 Fn) {
+//    const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//    const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//    const float x1=xa-float(xb), y1=ya-float(yb), z1=za-float(zb); // calculate interpolation factors
+//    for(uint c=0u; c<8u; c++) { // count over eight corner points
+//        const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//        const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//        const uint n = uint(x)+uint(y+z*ubo.Ny)*uint(ubo.Nx); // calculate lattice linear index
+//        const float d = (1.0f-abs(x1-float(i)))*(1.0f-abs(y1-float(j)))*(1.0f-abs(z1-float(k))); // force spreading
+//        atomicAdd(bfs[            uint(n)], 0.01f*Fn.x*d); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
+//        atomicAdd(bfs[   ubo.Nxyz+uint(n)], 0.01f*Fn.y*d); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
+//        atomicAdd(bfs[2u*ubo.Nxyz+uint(n)], 0.01f*Fn.z*d); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
+//    }
+//}
+
 void main() 
 {
-    //uint index = gl_GlobalInvocationID.x;
     uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
     uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
     if (index >= ubo.particleCount) return;
 
     Particle particle = particles[index];
     
-    vec3 pos = particle.position.xyz;
-    vec3 u = interpolate_u(pos); // trilinear interpolation of velocity at point p
-    u = (u + length(u) * particle_boundary_force(pos)); // apply boundary force
-    pos = pos + u; // new position
+    vec3 p0 = particle.position.xyz;// cache particle position
 
-    particles[index].position = vec4(pos, 0.0f);
-    if (pos.x <= 0 || pos.x >= ubo.Nx - 1 || pos.y <= 0 || pos.y >= ubo.Ny - 1 || pos.z <= 0 || pos.z >= ubo.Nz - 1)
-        particles[index].color = vec4(1.0f, 0.0f, 0.0f, 1.0f);
+    if(ubo.particleRho != 1.0f) { // FORCE_FILED
+		const float drho = ubo.particleRho-1.0f; // density difference leads to particle buoyancy
+		vec3 Fn = vec3(ubo.fx*drho, ubo.fy*drho, ubo.fz*drho); // F = F_p+F_f = (m_p-m_f)*g = (rho_p-rho_f)*g*V
+		spread_force(p0, Fn); // do force spreading
+	}
+
+    const vec3 p1 = p0;
+    vec3 un = interpolate_u(p1); // trilinear interpolation of velocity at point p
+    un = (un + length(un) * particle_boundary_force(p1));
+    const vec3 p = p0 + un; // advect particles
+    particles[index].position = vec4(p, 0.0f);
 }

@@ -119,9 +119,9 @@ layout(std430, binding = 5) buffer FOld {
     vecQ f_old[];
 };
 
-layout(std430, binding = 6) buffer FNew {
-    vecQ f_new[];
-};
+//layout(std430, binding = 6) buffer FNew {
+//    vecQ f_new[];
+//};
 
 vecQ f_eq(uint ijz) {
     return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
@@ -131,20 +131,20 @@ layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 void main() 
 {
-    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
-    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
-    if (index >= ubo.Nxyz) return;
-    
-    // index = i + (j + k * ubo.Ny) * ubo.Nx;
-    uint i = index % ubo.Nx, j = (index - i) / ubo.Nx % ubo.Ny, k = index / ubo.Nx / ubo.Ny;
-    
-    if (i < 1 || i >= ubo.Nx - 1 || j < 1 || j >= ubo.Ny - 1 || k < 1 || k >= ubo.Nz - 1) return;
-    rho[index] = 0;
-    vel[index] = vec4(0.0f, 0.0f, 0.0f, 0.0f);
-    for (uint q = 0; q < Q; ++q) {
-        f_old[index].f[q] = f_new[index].f[q];
-        rho[index] += f_new[index].f[q];
-        vel[index].xyz += e[q] * f_new[index].f[q];
-    }
-    vel[index].xyz /= rho[index];
+    //uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    //uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    //if (index >= ubo.Nxyz) return;
+    //
+    //// index = i + (j + k * ubo.Ny) * ubo.Nx;
+    //uint i = index % ubo.Nx, j = (index - i) / ubo.Nx % ubo.Ny, k = index / ubo.Nx / ubo.Ny;
+    //
+    //if (i < 1 || i >= ubo.Nx - 1 || j < 1 || j >= ubo.Ny - 1 || k < 1 || k >= ubo.Nz - 1) return;
+    //rho[index] = 0;
+    //vel[index] = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+    //for (uint q = 0; q < Q; ++q) {
+    //    f_old[index].f[q] = f_new[index].f[q];
+    //    rho[index] += f_new[index].f[q];
+    //    vel[index].xyz += e[q] * f_new[index].f[q];
+    //}
+    //vel[index].xyz /= rho[index];
 }

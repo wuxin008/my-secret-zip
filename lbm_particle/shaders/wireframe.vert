@@ -17,12 +17,13 @@ layout(location = 1) in vec4 inColor;
 
 layout(location = 0) out vec3 fragColor;
 
-vec3 particle_norm(vec3 pos) {
-    return vec3(pos.x / ubo.Nx - 0.5f, pos.y / ubo.Ny - 0.5f, pos.z / ubo.Nz - 0.5f);
+vec3 particle_norm(vec3 pos, float factor) {
+    return vec3((pos.x - ubo.Nx / 2.0f) / factor, (pos.y - ubo.Ny / 2.0f) / factor, (pos.z - ubo.Nz / 2.0f) / factor);
 }
 
 void main() {
     gl_PointSize = 2.0;
-    gl_Position = ubo.proj * ubo.view * ubo.model * vec4(particle_norm(inPosition.xyz), 1.0);
+    float factor = max(ubo.Nx, max(ubo.Ny, ubo.Nz));
+    gl_Position = ubo.proj * ubo.view * ubo.model * vec4(particle_norm(inPosition.xyz, factor), 1.0);
     fragColor = inColor.rgb;
 }

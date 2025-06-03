@@ -129,9 +129,9 @@ layout(std430, binding = 5) buffer FOld {
     vecQ f_old[];
 };
 
-layout(std430, binding = 6) buffer FNew {
-    vecQ f_new[];
-};
+//layout(std430, binding = 6) buffer FNew {
+//    vecQ f_new[];
+//};
 
 vecQ f_eq(uint ijz) {
     return createVecQ(rho[ijz], createVecQ(vel[ijz].xyz), dot(vel[ijz].xyz, vel[ijz].xyz));
@@ -163,7 +163,7 @@ void main()
     uint i = index % ubo.Nx, j = (index - i) / ubo.Nx % ubo.Ny, k = index / ubo.Nx / ubo.Ny;
 
     if (i < 0 || i > ubo.Nx - 1 || j < 0 || j > ubo.Ny - 1 || k < 0 || k > ubo.Nz - 1) return;
-
+    
     bool i0 = (i == 0), iN = (i == ubo.Nx - 1), j0 = (j == 0), jN = (j == ubo.Ny - 1), k0 = (k == 0), kN = (k == ubo.Nz - 1);
     if (i0 && !j0 && !jN && !k0 && !kN) {
         apply_bc_core(1, 0, index, index + 1);
